@@ -1,425 +1,191 @@
-# Whitelist AWS IP Ranges - Lambda
+# whitelist-aws-ips
 
-Lambda for whitelisting Amazon IP ranges in Security Group outbound rules.
+[![CI](https://github.com/boris-yakimov/whitelist-aws-ips/actions/workflows/go.yml/badge.svg)](https://github.com/boris-yakimov/whitelist-aws-ips/actions/workflows/go.yml)
 
-Works by updating Security Group Egress rules with a list of AWS IP Ranges based on AWS Service Nam.
-Pulls latest JSON from - https://docs.aws.amazon.com/general/latest/gr/aws-ip-ranges.html
+An AWS Lambda function that keeps EC2 security group **egress** rules in sync with the
+[published AWS IP address ranges](https://docs.aws.amazon.com/vpc/latest/userguide/aws-ip-ranges.html)
+for selected AWS services (e.g. `S3`, `API_GATEWAY`).
 
-This is written in Go as practice for using the AWS SDK and Golang in general.
+Use it to lock down outbound traffic from private workloads to specific AWS services
+without opening `0.0.0.0/0`.
 
-## Build Lambda zip
+## How it works
 
-Locally :
+1. Downloads [`ip-ranges.json`](https://ip-ranges.amazonaws.com/ip-ranges.json).
+2. Compares its `createDate` with the value stored in SSM Parameter Store; if unchanged, the run exits.
+3. Selects the IPv4 prefixes of the configured services and widens them to `/16`
+   supernets (prefixes already wider than `/16` are kept), removing duplicates and
+   overlapping ranges.
+4. Reads the current egress rules of the configured security groups and adds a
+   `tcp/<port>` rule for every missing CIDR, filling groups in order without
+   exceeding the per-group rule limit. Capacity is checked **before** any change is made.
+5. Records each added CIDR (with its security group and timestamp) in a DynamoDB table
+   for auditing. The table is created on first run.
+6. Saves the new `createDate` to SSM — only after all updates succeeded, so a failed
+   run is fully retried next time.
 
-Linux : 
-```
-# Get dependency
-go get -u github.com/aws/aws-lambda-go/cmd/build-lambda-zip
-```
+The security groups themselves are the source of truth, so runs are idempotent and
+safe to repeat. Existing rules are never removed.
 
-```
-# Compile and zip
-GOOS=linux go build main.go && zip go_lambda.zip main
-```
+> Widening to `/16` trades precision for a manageable number of rules: the allowed
+> ranges may include addresses that do not belong to the selected services.
 
-Windows : 
-```
-# Get dependency
-go get -u github.com/aws/aws-lambda-go/cmd/build-lambda-zip
-```
+## Configuration
 
-```
-# Compile and zip
-$env:GOOS = "linux"
-$env:CGO_ENABLED = "0"
-$env:GOARCH = "amd64"
-go build -o main main.go; ~\Go\Bin\build-lambda-zip.exe -output go_lambda.zip main
-```
+Set as Lambda environment variables:
 
-Using Make : 
+| Variable                | Required | Default                                          | Description                                              |
+|-------------------------|----------|--------------------------------------------------|----------------------------------------------------------|
+| `securityGroupIDs`      | yes      | –                                                | Comma-separated security group IDs to manage             |
+| `servicesToBeWhitelist` | yes      | –                                                | Comma-separated service names from `ip-ranges.json`, e.g. `S3,API_GATEWAY` |
+| `awsRegion`             | no       | Lambda's `AWS_REGION`                            | Region of the security groups, table and parameter       |
+| `amazonIPRangesURL`     | no       | `https://ip-ranges.amazonaws.com/ip-ranges.json` | Source of the IP ranges                                  |
+| `dynamoTableName`       | no       | `whitelistedIPRanges`                            | DynamoDB audit table (created if missing)                |
+| `previousDateParamStore`| no       | `lastModifiedDateIPRanges`                       | SSM parameter holding the last processed `createDate` (created if missing) |
+| `egressPort`            | no       | `443`                                            | TCP port allowed by the egress rules                     |
+| `maxRulesPerGroup`      | no       | `50`                                             | Max egress rules per security group (match your [VPC quota](https://docs.aws.amazon.com/vpc/latest/userguide/amazon-vpc-limits.html#vpc-limits-security-groups)) |
 
-```
-$ make run
-go run main.go
-Hello
+Service names are case-insensitive. Available values include `AMAZON`, `S3`, `EC2`,
+`CLOUDFRONT`, `DYNAMODB`, `API_GATEWAY`, `ROUTE53_HEALTHCHECKS`, `CODEBUILD`; see the
+[documentation](https://docs.aws.amazon.com/vpc/latest/userguide/aws-ip-syntax.html) for the full list.
 
-$ make build                                      
-go build -o bin/lambda lambda.go
+If the configured groups do not have enough free rule slots, the run fails with a
+message stating how many are needed — add another security group to `securityGroupIDs`.
 
-$ make compile
-echo "Compiling for every OS and Platform"
-Compiling for every OS and Platform
-# Linux
-GOOS=linux GOARCH=amd64 go build -o bin/lambda-linux-amd64 lambda.go
-# Windows binary
-GOOS=windows GOARCH=amd64 go build -o bin/lambda-windows-amd64 lambda.go
-```
+## Build
 
-### Create Lambda
-```
-aws lambda create-function --function-name my-function --runtime go1.x \
-  --zip-file fileb://go_lambda.zip --handler main \
-  --role arn:aws:iam::123456789012:role/execution_role
+Requires Go (version in [`go.mod`](go.mod)), `make` and `zip`.
 
-```
-Setup Lambda env variables :
-
-|  Key | Value  | Description |
-|---   |---     |---          |
-| amazonIPRangesURL |	https://ip-ranges.amazonaws.com/ip-ranges.json | URL with AWS IP ranges |
-| awsRegion  | eu-central-1 | AWS Region |
-| dynamoTableName  | whitelistedIPRanges | Name of DynamoDB table to store whitelisted IP ranges |
-| previousDateParamStore  | lastModifiedDateIPRanges | SSM Param store name to keep modified date of AWS JSON file |
-| securityGroupIDs  | sg-041c5e7daf95e16a3 | Comma separated list of Security groups (no spaces) |
-| servicesToBeWhitelist  | S3 | Comma separated list of AWS Services from JSON list (no spaces) |
-
-
-Setup a Lambda Trigger, e.g. time based
-EventBridge trigger - scheduled expressions
-```
-# Run every hour
-cron(0 * * * ? *)
-
-# Run every 30 min
-cron(0/30 * * * ? *)
+```sh
+make package   # -> dist/whitelist-aws-ips.zip (linux/arm64)
+make test      # unit tests with race detector
+make help      # list all targets
 ```
 
-### IAM Policy Permissions needed
-TODO: add IAM policy example
-```
-SSM Param Store - Get/Put Parameter
-Cloudwatch - log groups
-DynamoDB - create/describe table, get/put item
-Security Groups - update
-```
+For x86_64 Lambdas use `make package GOARCH=amd64`.
 
+## Deploy
 
-### Test locally :
+1. Create an execution role with the [IAM policy](#iam-policy) below plus the
+   `AWSLambdaBasicExecutionRole` managed policy for CloudWatch Logs.
 
-```
-# Go Dependencies
-go get -u github.com/aws/aws-sdk-go/...
-go get -u github.com/aws/aws-lambda-go/lambda
-```
+2. Create the function (custom runtime, `provided.al2023`):
 
+   ```sh
+   aws lambda create-function \
+     --function-name whitelist-aws-ips \
+     --runtime provided.al2023 \
+     --architectures arm64 \
+     --handler bootstrap \
+     --timeout 120 \
+     --memory-size 256 \
+     --zip-file fileb://dist/whitelist-aws-ips.zip \
+     --role arn:aws:iam::123456789012:role/whitelist-aws-ips \
+     --environment 'Variables={securityGroupIDs=sg-0123456789abcdef0,servicesToBeWhitelist=S3}'
+   ```
 
-Setup AWS Credentials
-```
-# Linux
-export AWS_ACCESS_KEY_ID=YOUR_AKID
-export AWS_SECRET_ACCESS_KEY=YOUR_SECRET_KEY
-```
+   To update the code later:
 
-```
-# Windows
-$env:AWS_ACCESS_KEY_ID='YOUR_AKID'
-$env:AWS_SECRET_ACCESS_KEY='YOUR_SECRET_KEY'
-```
+   ```sh
+   aws lambda update-function-code --function-name whitelist-aws-ips \
+     --zip-file fileb://dist/whitelist-aws-ips.zip
+   ```
 
-Hardcoded Variables example
-```
-// List of Security groups to be updated
-securityGroupIDs := []string{"sg-041c5e7daf95e16a3"}
+3. Schedule it with EventBridge, e.g. hourly:
 
-// List of services to be whitelisted - e.g. AMAZON, COUDFRONT, S3, EC2, API_GATEWAY, DYNAMODB, ROUTE53_HEALTHCHECKS, CODEBUILD
-servicesToBeWhitelist := []string{"S3"}
+   ```sh
+   aws scheduler create-schedule \
+     --name whitelist-aws-ips-hourly \
+     --schedule-expression 'rate(1 hour)' \
+     --flexible-time-window Mode=OFF \
+     --target 'Arn=arn:aws:lambda:eu-central-1:123456789012:function:whitelist-aws-ips,RoleArn=arn:aws:iam::123456789012:role/scheduler-invoke-whitelist-aws-ips'
+   ```
 
-// AWS JSON URL and local download path
-amazonIPRangesURL := "https://ip-ranges.amazonaws.com/ip-ranges.json"
+   Alternatively, subscribe the function to the `AmazonIpSpaceChanged` SNS topic
+   (`arn:aws:sns:us-east-1:806199016981:AmazonIpSpaceChanged`) to run only when AWS publishes a change.
 
-// AWS SSM Param Store that hold the last modified date of the JSON file - format "2020-09-18-21-51-15"
-previousDateParamStore := "lastModifiedDateIPRanges"
+### IAM policy
 
-// AWS DynamoDB table to be created that will maintain a list of all whitelisted IP Ranges
-dynamoTableName := "whitelistedIPRanges"
+Least-privilege policy; replace region, account ID and resource names as needed.
 
-// Set AWS Region
-awsRegion := "eu-central-1"
-```
-
-### Common errors
-
-##### SSM Param Store
-```
-# You need a IAM policy with permissions to SSM : 
-panic: AccessDeniedException: User: arn:aws:iam::111111111111:user/test is not authorized to perform: ssm:GetParameter on resource: arn:aws:ssm:eu-central-1:111111111111:parameter/lastModifiedDateIPRanges
-        status code: 400, request id: 4a0ab454-176d-4bc6-9418-78529da0f944
-
-# Make sure that no permissions boundary is also not limiting you in case you already have an IAM policy with sufficient access.
-```
-
-```
-"errorMessage": "updateSecurityGroups: Cannot update security group: awsUpdateSg: UnauthorizedOperation: You are not authorized to perform this operation. Encoded authorization failure message: ... n\tstatus code: 403, request id: a2cfb4ab-b102-4eaa-bda6-cc9d326c4fa7",
-"errorType": "wrapError"
-
-```
-
-##### Security Groups
-```
-# You did not provide endough Security Groups to fit all IP ranges :
-panic: [ERROR]: You will need [5] Security Groups, you provided [2]
-```
-
-##### Successful run example outputs
-1. When the AWS JSON file has not changed
-```
-START RequestId: fb9dddc4-3a0a-4c1a-bc75-a82f0f28373d Version: $LATEST
-IP Ranges that need to be in whitelist: [10]
-List of IP Ranges : [3.5.0.0/16 52.219.0.0/16 52.95.0.0/16 108.175.0.0/16 52.92.0.0/16 54.231.0.0/16 52.218.0.0/16 52.216.0.0/16 54.222.0.0/16 52.82.0.0/16]
-Last modifed date : 2020-10-10-04-51-17
-Amazon JSON file has not changed since last run, exiting ...
-Lambda exeuction completed successfully
-END RequestId: fb9dddc4-3a0a-4c1a-bc75-a82f0f28373d
-REPORT RequestId: fb9dddc4-3a0a-4c1a-bc75-a82f0f28373d	Duration: 358.33 ms	Billed Duration: 400 ms	Memory Size: 512 MB	Max Memory Used: 55 MB	Init Duration: 124.49 ms	
-```
-
-2. When AWS JSON file has changed but there are no new IP Ranges to be whitelisted : 
-```
-START RequestId: 81d73f22-bb79-47ac-b151-9b7787a20b36 Version: $LATEST
-IP Ranges that need to be in whitelist: [10]
-List of IP Ranges : [3.5.0.0/16 52.219.0.0/16 52.95.0.0/16 108.175.0.0/16 52.92.0.0/16 54.231.0.0/16 52.218.0.0/16 52.216.0.0/16 54.222.0.0/16 52.82.0.0/16]
-AWS JSON file has changed since last run, previous date: 2020-10-10-04-51-17213
-Updating creation date to 2020-10-10-04-51-17
-Parameter store [lastModifiedDateIPRanges] type [String] updated successfully with value [2020-10-10-04-51-17]
-Modified date changed
-Checking if DynamoDB table exists ...
-[whitelistedIPRanges] table already exists
-Checking if any IP Ranges need to be whitelisted ...
-Checking item: 3.5.0.0/16
-Checking item: 52.219.0.0/16
-Checking item: 52.95.0.0/16
-Checking item: 108.175.0.0/16
-Checking item: 52.92.0.0/16
-Checking item: 54.231.0.0/16
-Checking item: 52.218.0.0/16
-Checking item: 52.216.0.0/16
-Checking item: 54.222.0.0/16
-Checking item: 52.82.0.0/16
-No new IP Ranges found, exiting
-Lambda exeuction completed successfully
-END RequestId: 81d73f22-bb79-47ac-b151-9b7787a20b36
-REPORT RequestId: 81d73f22-bb79-47ac-b151-9b7787a20b36	Duration: 185.74 ms	Billed Duration: 200 ms	Memory Size: 512 MB	Max Memory Used: 56 MB	
-```
-
-3. When there are new a few new IP Addresses to be added : 
-```
-START RequestId: f306eedc-8341-429c-be10-6e5c6a8f5dfe Version: $LATEST
-IP Ranges that need to be in whitelist: [10]
-List of IP Ranges : [3.5.0.0/16 52.219.0.0/16 52.95.0.0/16 108.175.0.0/16 52.92.0.0/16 54.231.0.0/16 52.218.0.0/16 52.216.0.0/16 54.222.0.0/16 52.82.0.0/16]
-AWS JSON file has changed since last run, previous date: 2020-10-10-04-51-17312
-Updating creation date to 2020-10-10-04-51-17
-Parameter store [lastModifiedDateIPRanges] type [String] updated successfully with value [2020-10-10-04-51-17]
-Modified date changed
-Checking if DynamoDB table exists ...
-[whitelistedIPRanges] table already exists
-Checking if any IP Ranges need to be whitelisted ...
-Checking item: 3.5.0.0/16
-Checking item: 52.219.0.0/16
-Adding IP in Dynamo table : 52.219.0.0/16
-Successfully updated dynamo table whitelistedIPRanges
-Checking item: 52.95.0.0/16
-Checking item: 108.175.0.0/16
-Checking item: 52.92.0.0/16
-Checking item: 54.231.0.0/16
-Checking item: 52.218.0.0/16
-Adding IP in Dynamo table : 52.218.0.0/16
-Successfully updated dynamo table whitelistedIPRanges
-Checking item: 52.216.0.0/16
-Checking item: 54.222.0.0/16
-Checking item: 52.82.0.0/16
-
-Adding IP range [52.219.0.0/16] to Security Group [sg-041c5e7daf95e16a3]... 
-IP Range added successfully
-
-Adding IP range [52.218.0.0/16] to Security Group [sg-041c5e7daf95e16a3]... 
-IP Range added successfully
-Security group update finished
-Successfully populated IP addresses in security groups [sg-041c5e7daf95e16a3]
-
-Describe Security Group Egress Rules : 
-
- {
-  Description: "not used",
-  GroupId: "sg-041c5e7daf95e16a3",
-  GroupName: "test1234",
-  IpPermissionsEgress: [{
-      FromPort: 443,
-      IpProtocol: "tcp",
-      IpRanges: [
-        {
-          CidrIp: "52.95.0.0/16"
-        },
-        {
-          CidrIp: "108.175.0.0/16"
-        },
-        {
-          CidrIp: "52.92.0.0/16"
-        },
-        {
-          CidrIp: "54.231.0.0/16"
-        },
-        {
-          CidrIp: "52.216.0.0/16"
-        },
-        {
-          CidrIp: "54.222.0.0/16"
-        },
-        {
-          CidrIp: "52.82.0.0/16"
-        },
-        {
-          CidrIp: "3.5.0.0/16"
-        },
-        {
-          CidrIp: "52.219.0.0/16"
-        },
-        {
-          CidrIp: "52.218.0.0/16"
-        }
-      ],
-      ToPort: 443
-    }],
-  OwnerId: "722377226063",
-  VpcId: "vpc-342c735c"
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DescribeSecurityGroups",
+      "Effect": "Allow",
+      "Action": "ec2:DescribeSecurityGroups",
+      "Resource": "*"
+    },
+    {
+      "Sid": "UpdateEgressRules",
+      "Effect": "Allow",
+      "Action": "ec2:AuthorizeSecurityGroupEgress",
+      "Resource": [
+        "arn:aws:ec2:eu-central-1:123456789012:security-group/sg-0123456789abcdef0"
+      ]
+    },
+    {
+      "Sid": "LastProcessedDate",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter", "ssm:PutParameter"],
+      "Resource": "arn:aws:ssm:eu-central-1:123456789012:parameter/lastModifiedDateIPRanges"
+    },
+    {
+      "Sid": "AuditTable",
+      "Effect": "Allow",
+      "Action": ["dynamodb:DescribeTable", "dynamodb:CreateTable", "dynamodb:PutItem"],
+      "Resource": "arn:aws:dynamodb:eu-central-1:123456789012:table/whitelistedIPRanges"
+    }
+  ]
 }
-Lambda exeuction completed successfully
-END RequestId: f306eedc-8341-429c-be10-6e5c6a8f5dfe
-REPORT RequestId: f306eedc-8341-429c-be10-6e5c6a8f5dfe	Duration: 542.66 ms	Billed Duration: 600 ms	Memory Size: 512 MB	Max Memory Used: 59 MB	
 ```
 
-4. On First Lambda run if all IAM policy permissions are set okay. Ignore the resource not found exceptions on the first run as they should not appear aferwards.
+`dynamodb:CreateTable` can be dropped if you create the table yourself
+(partition key `awsIPRanges`, type `String`).
+
+## Output
+
+Logs are structured JSON (CloudWatch Logs Insights friendly):
+
+```json
+{"time":"2026-10-08T13:00:01Z","level":"INFO","msg":"resolved ip ranges","services":["S3"],"count":10,"createDate":"2026-10-08-11-03-09"}
+{"time":"2026-10-08T13:00:01Z","level":"INFO","msg":"ip ranges changed","previous":"2026-10-01-20-13-04","current":"2026-10-08-11-03-09"}
+{"time":"2026-10-08T13:00:02Z","level":"INFO","msg":"whitelisted ip ranges","securityGroup":"sg-0123456789abcdef0","cidrs":["52.218.0.0/16"]}
 ```
-START RequestId: 7e3275c6-1169-4080-9178-aa0c9fb09485 Version: $LATEST
-IP Ranges that need to be in whitelist: [10]
-List of IP Ranges : [3.5.0.0/16 52.219.0.0/16 52.95.0.0/16 108.175.0.0/16 52.92.0.0/16 54.231.0.0/16 52.218.0.0/16 52.216.0.0/16 54.222.0.0/16 52.82.0.0/16]
-AWS JSON file has changed since last run, previous date: 2020-10-10-04-51-17132213
-Updating creation date to 2020-10-10-04-51-17
-Parameter store [lastModifiedDateIPRanges] type [String] updated successfully with value [2020-10-10-04-51-17]
-Modified date changed
-Checking if DynamoDB table exists ...
-Table [whitelistedIPRanges] does not exist
-createDynamoTable: Successfully create table [whitelistedIPRanges]
-Checking if any IP Ranges need to be whitelisted ...
-Checking item: 3.5.0.0/16
-ResourceNotFoundException ResourceNotFoundException: Requested resource not found
-Adding IP in Dynamo table : 3.5.0.0/16
-Successfully updated dynamo table whitelistedIPRanges
-Checking item: 52.219.0.0/16
-ResourceNotFoundException ResourceNotFoundException: Requested resource not found
-Adding IP in Dynamo table : 52.219.0.0/16
-Successfully updated dynamo table whitelistedIPRanges
-Checking item: 52.95.0.0/16
-ResourceNotFoundException ResourceNotFoundException: Requested resource not found
-Adding IP in Dynamo table : 52.95.0.0/16
-Successfully updated dynamo table whitelistedIPRanges
-Checking item: 108.175.0.0/16
-ResourceNotFoundException ResourceNotFoundException: Requested resource not found
-Adding IP in Dynamo table : 108.175.0.0/16
-Successfully updated dynamo table whitelistedIPRanges
-Checking item: 52.92.0.0/16
-ResourceNotFoundException ResourceNotFoundException: Requested resource not found
-Adding IP in Dynamo table : 52.92.0.0/16
-Successfully updated dynamo table whitelistedIPRanges
-Checking item: 54.231.0.0/16
-ResourceNotFoundException ResourceNotFoundException: Requested resource not found
-Adding IP in Dynamo table : 54.231.0.0/16
-Successfully updated dynamo table whitelistedIPRanges
-Checking item: 52.218.0.0/16
-ResourceNotFoundException ResourceNotFoundException: Requested resource not found
-Adding IP in Dynamo table : 52.218.0.0/16
-Successfully updated dynamo table whitelistedIPRanges
-Checking item: 52.216.0.0/16
-ResourceNotFoundException ResourceNotFoundException: Requested resource not found
-Adding IP in Dynamo table : 52.216.0.0/16
-Successfully updated dynamo table whitelistedIPRanges
-Checking item: 54.222.0.0/16
-ResourceNotFoundException ResourceNotFoundException: Requested resource not found
-Adding IP in Dynamo table : 54.222.0.0/16
-Successfully updated dynamo table whitelistedIPRanges
-Checking item: 52.82.0.0/16
-ResourceNotFoundException ResourceNotFoundException: Requested resource not found
-Adding IP in Dynamo table : 52.82.0.0/16
-Successfully updated dynamo table whitelistedIPRanges
 
-Adding IP range [3.5.0.0/16] to Security Group [sg-041c5e7daf95e16a3]... 
-IP Range added successfully
+The function returns a summary of the run:
 
-Adding IP range [52.219.0.0/16] to Security Group [sg-041c5e7daf95e16a3]... 
-IP Range added successfully
-
-Adding IP range [52.95.0.0/16] to Security Group [sg-041c5e7daf95e16a3]... 
-IP Range added successfully
-
-Adding IP range [108.175.0.0/16] to Security Group [sg-041c5e7daf95e16a3]... 
-IP Range added successfully
-
-Adding IP range [52.92.0.0/16] to Security Group [sg-041c5e7daf95e16a3]... 
-IP Range added successfully
-
-Adding IP range [54.231.0.0/16] to Security Group [sg-041c5e7daf95e16a3]... 
-IP Range added successfully
-
-Adding IP range [52.218.0.0/16] to Security Group [sg-041c5e7daf95e16a3]... 
-IP Range added successfully
-
-Adding IP range [52.216.0.0/16] to Security Group [sg-041c5e7daf95e16a3]... 
-IP Range added successfully
-
-Adding IP range [54.222.0.0/16] to Security Group [sg-041c5e7daf95e16a3]... 
-IP Range added successfully
-
-Adding IP range [52.82.0.0/16] to Security Group [sg-041c5e7daf95e16a3]... 
-IP Range added successfully
-Security group update finished
-Successfully populated IP addresses in security groups [sg-041c5e7daf95e16a3]
-
-Describe Security Group Egress Rules : 
-
- {
-  Description: "not used",
-  GroupId: "sg-041c5e7daf95e16a3",
-  GroupName: "test1234",
-  IpPermissionsEgress: [{
-      FromPort: 443,
-      IpProtocol: "tcp",
-      IpRanges: [
-        {
-          CidrIp: "3.5.0.0/16"
-        },
-        {
-          CidrIp: "52.219.0.0/16"
-        },
-        {
-          CidrIp: "52.95.0.0/16"
-        },
-        {
-          CidrIp: "108.175.0.0/16"
-        },
-        {
-          CidrIp: "52.92.0.0/16"
-        },
-        {
-          CidrIp: "54.231.0.0/16"
-        },
-        {
-          CidrIp: "52.218.0.0/16"
-        },
-        {
-          CidrIp: "52.216.0.0/16"
-        },
-        {
-          CidrIp: "54.222.0.0/16"
-        },
-        {
-          CidrIp: "52.82.0.0/16"
-        }
-      ],
-      ToPort: 443
-    }],
-  OwnerId: "722377226063",
-  VpcId: "vpc-342c735c"
+```json
+{
+  "createDate": "2026-10-08-11-03-09",
+  "skipped": false,
+  "desiredRanges": 10,
+  "added": [{ "groupId": "sg-0123456789abcdef0", "cidrs": ["52.218.0.0/16"] }]
 }
-Lambda exeuction completed successfully
-END RequestId: 7e3275c6-1169-4080-9178-aa0c9fb09485
-REPORT RequestId: 7e3275c6-1169-4080-9178-aa0c9fb09485	Duration: 1780.98 ms	Billed Duration: 1800 ms	Memory Size: 512 MB	Max Memory Used: 59 MB	
 ```
+
+## Troubleshooting
+
+| Error | Cause |
+|-------|-------|
+| `invalid configuration: ...` | A required variable is missing or malformed; the message lists every problem. |
+| `AccessDeniedException` / `UnauthorizedOperation` | The execution role lacks a permission from the [IAM policy](#iam-policy). Also check permission boundaries and SCPs. |
+| `not enough free rule slots ... need N, have M` | Add another security group, or raise `maxRulesPerGroup` if your VPC quota allows. |
+| `no IP ranges found for services [...]` | The service names don't exist in `ip-ranges.json`. |
+
+## Project layout
+
+```
+cmd/whitelist-aws-ips/    Lambda entry point and wiring
+internal/config/          Environment configuration and validation
+internal/ipranges/        Download and summarise ip-ranges.json
+internal/securitygroup/   Capacity-aware, idempotent egress rule management
+internal/store/           SSM parameter and DynamoDB audit table
+internal/whitelist/       Run orchestration
+```
+
+## Changelog
+
+See [Changelog.md](Changelog.md).

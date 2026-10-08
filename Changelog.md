@@ -1,37 +1,42 @@
-### backlog:
+# Changelog
 
-**Initial release - v1.0** :
-- [x] Download Amazon IP range file and parse JSON data structure
-- [x] Update list of IP ranges in Security Groups / Describe Security Groups
-- [x] Work around SG limit of 60 inbound/outbound rules
-- [x] Persistent way of storing JSON modified date - SSM Param Store
-- [x] Better error handling
-- [x] Make AWS region configurable
-- [x] Update only entries that don't exist already - DynamoDB persistence
-  - [x] Check if DynamoDB table exists; 
-  - [x] Create DynamoDB table if doesn't exist
-  - [x] Add list of IP ranges in DynamoDB table
-  - [x] Only update if an entry is missing
-  - [x] Create list of IPs to be added in SG from DynamoDB Table
-- [x] Implement Lambda handler
-- [x] Create initial release v1
+## v2.0.0
 
-**Improvements - v1.1** : 
-- [x] Combine download and json parse funcs into one using decoder (no need to download the file locally)
-- [x] Add Lambda trigger example in Readme
-- [x] Move all vars to be taken from Lambda ENV vars instead of hardcoded
-- [x] Handle dependencies as Go modules
-- [x] Add CI with Github actions
-- [ ] Split functions into separate packages
-  - [ ] SSM Param store funcs
-  - [ ] Security Group functions
-  - [ ] DynamoDB functions
-- [ ] Add Unit Tests
-- [ ] Create SSM param store if it doesnt exist
-- [ ] Move all AWS svc client duplications to an init() function - https://tutorialedge.net/golang/the-go-init-function/; we can have more than 1 init() to initialize the different svc clients
-- [ ] Figure out a good way to link all SGs at the end into a single one - some sort of inheritance ?
-- [ ] Add IAM policy example with minimal access needed in Readme
+Rewrite focused on correctness, maintainability and deployability.
 
-**Fix Bugs** :
-- [x] Security group updates when IPs are less than 50 (they get duplicated in all SGs)
-- [x] Dynamo update items when the table needs to be created - it adds IPs in table but but goes to case where No new IP Ranges were found and doesnt update the SGs, although the Dynamo table is completely empty. putDynamoItem() also doesn't print its success messages, although items are successfully created there. But on next Lambda run eveyrthing is fine because Dynamo table with items already exist. Seems to be related to the regex check, but not sure why it happens only when table doesn't initially excist. We are hitting this condition : case dynamodb.ErrCodeResourceNotFoundException: return true, nil
+### Changed
+- Migrated to AWS SDK for Go v2 and the `provided.al2023` runtime (`go1.x` is deprecated).
+  The handler is now `bootstrap`, built for `arm64` by default.
+- Split the code into packages under `internal/` with interfaces for all AWS clients.
+- AWS clients are created once per cold start instead of per call.
+- Security groups are now the source of truth: current egress rules are read and only
+  missing CIDRs are added. DynamoDB is an audit log (`awsIPRanges`, `securityGroupId`, `createdAt`).
+- CIDRs are added in a single API call per security group, each with a rule description.
+- Structured JSON logging (`log/slog`); the handler returns a JSON run summary.
+- Configuration is validated up front; only `securityGroupIDs` and
+  `servicesToBeWhitelist` are required, everything else has defaults.
+- New optional settings `egressPort` and `maxRulesPerGroup`.
+- Makefile, CI (format, vet, race-enabled tests, golangci-lint, package artifact).
+
+### Fixed
+- `createDate` was saved before the security groups were updated, so a failed run was never retried.
+- `setParamStoreValue` errors were ignored.
+- Missing SSM parameter caused a failure on the first run; it is now created.
+- `PutItem` and `AuthorizeSecurityGroupEgress` errors were printed but swallowed.
+- Security group capacity check required an exact group count and ignored existing rules;
+  it now checks free slots across all groups before making changes.
+- Rule distribution could add the same CIDRs to multiple groups.
+- Newly created DynamoDB table was used before becoming `ACTIVE`.
+- DynamoDB presence check relied on a regex over a debug string.
+- `describeSecurityGroups` called `os.Exit` from inside the Lambda.
+- HTTP status codes of the IP ranges download were not checked.
+- Duplicate and overlapping CIDRs (e.g. a `/22` inside a `/8`) are collapsed.
+
+## v1.1
+- Decode JSON directly from the URL without a temporary file.
+- Configuration via Lambda environment variables.
+- Go modules and GitHub Actions CI.
+
+## v1.0
+- Initial release: download AWS IP ranges, update security group egress rules,
+  track state in SSM Parameter Store and DynamoDB.
